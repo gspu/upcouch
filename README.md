@@ -32,7 +32,7 @@ FreeBSD already includes:
 Compile using:
 
 ```sh
-cc upload.c -pthread -I/usr/local/include -L/usr/local/lib -lcurl -o upcouch
+cc upcouch.c -pthread -I/usr/local/include -L/usr/local/lib -lcurl -o upcouch
 ```
 
 Explanation:
