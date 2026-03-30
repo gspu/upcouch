@@ -106,7 +106,7 @@ upcouch 'db_usr="USER"' 'db_passwd="PASS"' 'db_hst="HOSTURL"' 'db_name="DBNAME"'
 
 upcouch can load all database parameters from a config file:
 
-    upcouch -c sample.conf
+    upcouch -c example.conf
 
 Example config file:
 
