@@ -7,6 +7,9 @@
 #include <fts.h>
 #include <pthread.h>
 
+#define MAX_FILE_SIZE 4294967296ULL   // 4 GiB
+#define MAX_THREADS   64
+
 // ------------------------------
 // Base64 encoding
 // ------------------------------
@@ -47,14 +50,26 @@ unsigned char *read_file_binary(const char *path, size_t *size_out) {
     long size = ftell(fp);
     rewind(fp);
 
+    if (size < 0 || (unsigned long long)size > MAX_FILE_SIZE) {
+        fprintf(stderr, "File too large (max 4 GiB): %s\n", path);
+        fclose(fp);
+        return NULL;
+    }
+
     unsigned char *buf = malloc(size);
     if (!buf) {
         fclose(fp);
         return NULL;
     }
 
-    fread(buf, 1, size, fp);
+    size_t n = fread(buf, 1, size, fp);
     fclose(fp);
+
+    if (n != (size_t)size) {
+        fprintf(stderr, "Short read error: %s\n", path);
+        free(buf);
+        return NULL;
+    }
 
     *size_out = size;
     return buf;
@@ -173,7 +188,7 @@ int upload_attachment(const char *filepath) {
     size_t filesize;
     unsigned char *filedata = read_file_binary(filepath, &filesize);
     if (!filedata) {
-        fprintf(stderr, "Skipping unreadable file: %s\n", filepath);
+        fprintf(stderr, "Skipping unreadable or oversized file: %s\n", filepath);
         return 1;
     }
 
@@ -285,6 +300,8 @@ char *queue_pop() {
 
 // Worker thread
 void *worker_thread(void *arg) {
+    (void)arg;   // suppress unused parameter warning
+
     while (1) {
         char *path = queue_pop();
         if (!path) break;
@@ -299,6 +316,12 @@ void *worker_thread(void *arg) {
 // Recursive directory walker
 // ------------------------------
 int upload_recursive_parallel(const char *root, int threads) {
+
+    if (threads < 1 || threads > MAX_THREADS) {
+        fprintf(stderr, "Invalid thread count (max %d)\n", MAX_THREADS);
+        return 1;
+    }
+
     pthread_t *tids = malloc(sizeof(pthread_t) * threads);
 
     for (int i = 0; i < threads; i++)

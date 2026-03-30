@@ -7,7 +7,9 @@ It supports:
 - Recursive directory traversal (`-r DIR`)
 - Binary‑safe Base64 attachments
 - Strict argument order
-- Credentials passed at runtime (never stored in source)
+- Optional config‑file mode (`-c file.conf`)
+- Max file size: 4 GiB
+- Max threads: 64
 
 Designed and tested on **FreeBSD** using **Clang**, **libcurl**, and **FTS**.
 
@@ -33,6 +35,11 @@ Compile using:
 
 ```sh
 cc upcouch.c -pthread -I/usr/local/include -L/usr/local/lib -lcurl -o upcouch
+```
+or
+
+```sh
+make
 ```
 
 Explanation:
