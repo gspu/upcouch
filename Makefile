@@ -1,14 +1,11 @@
 # upcouch Makefile
-# FreeBSD-friendly build using clang + libcurl + pthreads
-
-CC      = cc
-CFLAGS  = -std=c11 -Wall -Wextra -O2
+CC = cc
+CFLAGS = -std=c11 -Wall -Wextra -O2
 LDFLAGS = -pthread -L/usr/local/lib
-LIBS    = -lcurl
+LIBS = -lcurl -lcrypto -lpthread
 INCLUDES = -I/usr/local/include
-
-TARGET  = upcouch
-SRC     = upcouch.c
+TARGET = upcouch
+SRC = upcouch.c
 
 all: $(TARGET)
 
