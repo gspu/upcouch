@@ -1,23 +1,43 @@
+/*
+ * upcouch.c
+ *
+ * Upload files as attachments to CouchDB.
+ * - Base64-encodes file contents
+ * - Wraps them in a JSON document with _attachments
+ * - Optionally uses deterministic document IDs (-n)
+ * - Recursive parallel upload mode (-p N -r <folder>)
+ *
+ * Build:
+ *   cc -Wall -Wextra -O2 -o upcouch upcouch.c -lcurl -lpthread
+ *
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <ctype.h>
 #include <curl/curl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fts.h>
 #include <pthread.h>
-#include <ctype.h>
-#include <stdint.h>
+#include <unistd.h>
 
-#define MAX_FILE_SIZE 4294967296ULL   // 4 GiB
+#define MAX_FILE_SIZE 4294967296ULL   /* 4 GiB */
 #define MAX_THREADS   64
 
-// Deterministic ID mode
+/* Deterministic ID mode */
 static int USE_DETERMINISTIC_ID = 0;
 
-// ------------------------------
-// SHA-256 implementation (minimal, public-domain style)
-// ------------------------------
+/* ------------------------------
+ * Minimal SHA-256 implementation
+ * Public-domain style, compact
+ * ------------------------------ */
+
 typedef struct {
     uint64_t bitlen;
     uint32_t state[8];
@@ -36,16 +56,22 @@ static const uint32_t k256[64] = {
     0x748f82eeUL,0x78a5636fUL,0x84c87814UL,0x8cc70208UL,0x90befffaUL,0xa4506cebUL,0xbef9a3f7UL,0xc67178f2UL
 };
 
-static uint32_t rotr32(uint32_t x, uint32_t n) {
+static inline uint32_t rotr32(uint32_t x, uint32_t n) {
     return (x >> n) | (x << (32 - n));
 }
 
 static void sha256_transform(sha256_ctx *ctx, const uint8_t data[64]) {
-    uint32_t a,b,c,d,e,f,g,h,i,j,t1,t2,m[64];
+    uint32_t m[64];
+    uint32_t a,b,c,d,e,f,g,h;
+    unsigned i;
 
-    for (i = 0, j = 0; i < 16; ++i, j += 4)
-        m[i] = (data[j] << 24) | (data[j+1] << 16) | (data[j+2] << 8) | (data[j+3]);
-    for ( ; i < 64; ++i) {
+    for (i = 0; i < 16; ++i) {
+        m[i] = ((uint32_t)data[i*4] << 24) |
+               ((uint32_t)data[i*4 + 1] << 16) |
+               ((uint32_t)data[i*4 + 2] << 8) |
+               ((uint32_t)data[i*4 + 3]);
+    }
+    for (i = 16; i < 64; ++i) {
         uint32_t s0 = rotr32(m[i-15],7) ^ rotr32(m[i-15],18) ^ (m[i-15] >> 3);
         uint32_t s1 = rotr32(m[i-2],17) ^ rotr32(m[i-2],19) ^ (m[i-2] >> 10);
         m[i] = m[i-16] + s0 + m[i-7] + s1;
@@ -63,19 +89,19 @@ static void sha256_transform(sha256_ctx *ctx, const uint8_t data[64]) {
     for (i = 0; i < 64; ++i) {
         uint32_t S1 = rotr32(e,6) ^ rotr32(e,11) ^ rotr32(e,25);
         uint32_t ch = (e & f) ^ ((~e) & g);
-        t1 = h + S1 + ch + k256[i] + m[i];
+        uint32_t temp1 = h + S1 + ch + k256[i] + m[i];
         uint32_t S0 = rotr32(a,2) ^ rotr32(a,13) ^ rotr32(a,22);
         uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-        t2 = S0 + maj;
+        uint32_t temp2 = S0 + maj;
 
         h = g;
         g = f;
         f = e;
-        e = d + t1;
+        e = d + temp1;
         d = c;
         c = b;
         b = a;
-        a = t1 + t2;
+        a = temp1 + temp2;
     }
 
     ctx->state[0] += a;
@@ -103,8 +129,7 @@ static void sha256_init(sha256_ctx *ctx) {
 
 static void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; ++i) {
-        ctx->data[ctx->datalen] = data[i];
-        ctx->datalen++;
+        ctx->data[ctx->datalen++] = data[i];
         if (ctx->datalen == 64) {
             sha256_transform(ctx, ctx->data);
             ctx->bitlen += 512;
@@ -116,38 +141,41 @@ static void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len) {
 static void sha256_final(sha256_ctx *ctx, uint8_t hash[32]) {
     uint32_t i = ctx->datalen;
 
+    /* Pad */
     if (ctx->datalen < 56) {
         ctx->data[i++] = 0x80;
-        while (i < 56)
-            ctx->data[i++] = 0x00;
+        while (i < 56) ctx->data[i++] = 0x00;
     } else {
         ctx->data[i++] = 0x80;
-        while (i < 64)
-            ctx->data[i++] = 0x00;
+        while (i < 64) ctx->data[i++] = 0x00;
         sha256_transform(ctx, ctx->data);
         memset(ctx->data, 0, 56);
     }
 
-    ctx->bitlen += ctx->datalen * 8;
-    ctx->data[63] = ctx->bitlen;
-    ctx->data[62] = ctx->bitlen >> 8;
-    ctx->data[61] = ctx->bitlen >> 16;
-    ctx->data[60] = ctx->bitlen >> 24;
-    ctx->data[59] = ctx->bitlen >> 32;
-    ctx->data[58] = ctx->bitlen >> 40;
-    ctx->data[57] = ctx->bitlen >> 48;
-    ctx->data[56] = ctx->bitlen >> 56;
+    /* Append length in bits as big-endian 64-bit */
+    ctx->bitlen += (uint64_t)ctx->datalen * 8ULL;
+    uint64_t bitlen = ctx->bitlen;
+    ctx->data[56] = (uint8_t)((bitlen >> 56) & 0xFF);
+    ctx->data[57] = (uint8_t)((bitlen >> 48) & 0xFF);
+    ctx->data[58] = (uint8_t)((bitlen >> 40) & 0xFF);
+    ctx->data[59] = (uint8_t)((bitlen >> 32) & 0xFF);
+    ctx->data[60] = (uint8_t)((bitlen >> 24) & 0xFF);
+    ctx->data[61] = (uint8_t)((bitlen >> 16) & 0xFF);
+    ctx->data[62] = (uint8_t)((bitlen >> 8) & 0xFF);
+    ctx->data[63] = (uint8_t)(bitlen & 0xFF);
+
     sha256_transform(ctx, ctx->data);
 
+    /* Produce big-endian hash */
     for (i = 0; i < 4; ++i) {
-        hash[i]      = (ctx->state[0] >> (24 - i * 8)) & 0xff;
-        hash[i + 4]  = (ctx->state[1] >> (24 - i * 8)) & 0xff;
-        hash[i + 8]  = (ctx->state[2] >> (24 - i * 8)) & 0xff;
-        hash[i + 12] = (ctx->state[3] >> (24 - i * 8)) & 0xff;
-        hash[i + 16] = (ctx->state[4] >> (24 - i * 8)) & 0xff;
-        hash[i + 20] = (ctx->state[5] >> (24 - i * 8)) & 0xff;
-        hash[i + 24] = (ctx->state[6] >> (24 - i * 8)) & 0xff;
-        hash[i + 28] = (ctx->state[7] >> (24 - i * 8)) & 0xff;
+        hash[i]      = (uint8_t)((ctx->state[0] >> (24 - i * 8)) & 0xFF);
+        hash[i + 4]  = (uint8_t)((ctx->state[1] >> (24 - i * 8)) & 0xFF);
+        hash[i + 8]  = (uint8_t)((ctx->state[2] >> (24 - i * 8)) & 0xFF);
+        hash[i + 12] = (uint8_t)((ctx->state[3] >> (24 - i * 8)) & 0xFF);
+        hash[i + 16] = (uint8_t)((ctx->state[4] >> (24 - i * 8)) & 0xFF);
+        hash[i + 20] = (uint8_t)((ctx->state[5] >> (24 - i * 8)) & 0xFF);
+        hash[i + 24] = (uint8_t)((ctx->state[6] >> (24 - i * 8)) & 0xFF);
+        hash[i + 28] = (uint8_t)((ctx->state[7] >> (24 - i * 8)) & 0xFF);
     }
 }
 
@@ -158,53 +186,61 @@ static void sha256_bytes(const uint8_t *data, size_t len, uint8_t out[32]) {
     sha256_final(&ctx, out);
 }
 
-// ------------------------------
-// Base64 encoding
-// ------------------------------
-static const char b64_table[] =
+/* ------------------------------
+ * Base64 encoding (single canonical implementation)
+ * ------------------------------ */
+
+static const char base64_table[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-char *base64_encode(const unsigned char *data, size_t input_length) {
+static char *base64_encode(const unsigned char *data, size_t input_length) {
     size_t output_length = 4 * ((input_length + 2) / 3);
     char *encoded = malloc(output_length + 1);
     if (!encoded) return NULL;
 
-    size_t i, j;
-    for (i = 0, j = 0; i < input_length;) {
+    size_t i = 0, j = 0;
+    while (i < input_length) {
         uint32_t a = i < input_length ? data[i++] : 0;
         uint32_t b = i < input_length ? data[i++] : 0;
         uint32_t c = i < input_length ? data[i++] : 0;
 
         uint32_t triple = (a << 16) | (b << 8) | c;
 
-        encoded[j++] = b64_table[(triple >> 18) & 0x3F];
-        encoded[j++] = b64_table[(triple >> 12) & 0x3F];
-        encoded[j++] = (i > input_length + 1) ? '=' : b64_table[(triple >> 6) & 0x3F];
-        encoded[j++] = (i > input_length) ? '=' : b64_table[triple & 0x3F];
+        encoded[j++] = base64_table[(triple >> 18) & 0x3F];
+        encoded[j++] = base64_table[(triple >> 12) & 0x3F];
+        encoded[j++] = (i > input_length + 1) ? '=' : base64_table[(triple >> 6) & 0x3F];
+        encoded[j++] = (i > input_length) ? '=' : base64_table[triple & 0x3F];
     }
 
     encoded[j] = '\0';
     return encoded;
 }
 
-// ------------------------------
-// Read file binary
-// ------------------------------
-unsigned char *read_file_binary(const char *path, size_t *size_out) {
+/* ------------------------------
+ * Read file binary (uses fseeko/ftello)
+ * ------------------------------ */
+
+static unsigned char *read_file_binary(const char *path, size_t *size_out) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
 
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    rewind(fp);
-
-    if (size < 0 || (unsigned long long)size > MAX_FILE_SIZE) {
+    if (fseeko(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    off_t off = ftello(fp);
+    if (off < 0 || (unsigned long long)off > MAX_FILE_SIZE) {
         fprintf(stderr, "File too large (max 4 GiB): %s\n", path);
         fclose(fp);
         return NULL;
     }
+    if (fseeko(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
 
-    unsigned char *buf = malloc(size);
+    size_t size = (size_t)off;
+    unsigned char *buf = malloc(size ? size : 1); /* avoid malloc(0) */
     if (!buf) {
         fclose(fp);
         return NULL;
@@ -213,7 +249,7 @@ unsigned char *read_file_binary(const char *path, size_t *size_out) {
     size_t n = fread(buf, 1, size, fp);
     fclose(fp);
 
-    if (n != (size_t)size) {
+    if (n != size) {
         fprintf(stderr, "Short read error: %s\n", path);
         free(buf);
         return NULL;
@@ -223,20 +259,21 @@ unsigned char *read_file_binary(const char *path, size_t *size_out) {
     return buf;
 }
 
-// ------------------------------
-// Global DB credentials
-// ------------------------------
+/* ------------------------------
+ * Global DB credentials
+ * ------------------------------ */
+
 const char *DB_USER;
 const char *DB_PASS;
 const char *DB_HOST;
 const char *DB_NAME;
 
-// ------------------------------
-// Safe argument parser
-// ------------------------------
-int extract_value(const char *arg, const char *prefix, char *out, size_t outsz) {
-    size_t plen = strlen(prefix);
+/* ------------------------------
+ * Safe argument parser (returns 1 on success, 0 on failure)
+ * ------------------------------ */
 
+static int extract_value(const char *arg, const char *prefix, char *out, size_t outsz) {
+    size_t plen = strlen(prefix);
     if (strncmp(arg, prefix, plen) != 0) {
         fprintf(stderr, "Invalid argument: %s\n", arg);
         return 0;
@@ -244,65 +281,68 @@ int extract_value(const char *arg, const char *prefix, char *out, size_t outsz) 
 
     const char *start = arg + plen;
     const char *end = strrchr(start, '"');
-
     if (!end || end <= start) {
         fprintf(stderr, "Malformed argument: %s\n", arg);
         return 0;
     }
 
-    size_t len = end - start;
+    size_t len = (size_t)(end - start);
     if (len >= outsz) len = outsz - 1;
-
     memcpy(out, start, len);
-    out[len] = 0;
-
+    out[len] = '\0';
     return 1;
 }
 
-// ------------------------------
-// JSON string escaper
-// ------------------------------
+/* ------------------------------
+ * JSON string escaper (for filenames)
+ * ------------------------------ */
+
 static char *json_escape_string(const char *s) {
     size_t len = strlen(s);
+    /* Worst-case expansion: every byte -> \u00XX (6 chars) */
     size_t max_out = len * 6 + 1;
     char *out = malloc(max_out);
     if (!out) return NULL;
 
-    size_t i, j = 0;
-    for (i = 0; i < len; i++) {
+    size_t j = 0;
+    for (size_t i = 0; i < len; ++i) {
         unsigned char c = (unsigned char)s[i];
         if (c == '"' || c == '\\') {
             out[j++] = '\\';
             out[j++] = c;
         } else if (c < 0x20) {
-            snprintf(out + j, max_out - j, "\\u%04x", c);
-            j += 6;
+            /* control characters */
+            int n = snprintf(out + j, max_out - j, "\\u%04x", c);
+            if (n < 0) { free(out); return NULL; }
+            j += (size_t)n;
         } else {
-            out[j++] = c;
+            out[j++] = (char)c;
         }
     }
     out[j] = '\0';
     return out;
 }
 
-// ------------------------------
-// URL encoder
-// ------------------------------
+/* ------------------------------
+ * URL encoder (percent-encoding)
+ * ------------------------------ */
+
 static char *url_encode(const char *s) {
     size_t len = strlen(s);
     char *out = malloc(len * 3 + 1);
     if (!out) return NULL;
 
     size_t j = 0;
-    for (size_t i = 0; i < len; i++) {
+    for (size_t i = 0; i < len; ++i) {
         unsigned char c = (unsigned char)s[i];
         if ((c >= 'A' && c <= 'Z') ||
             (c >= 'a' && c <= 'z') ||
             (c >= '0' && c <= '9') ||
             c == '-' || c == '_' || c == '.' || c == '~') {
-            out[j++] = c;
+            out[j++] = (char)c;
         } else {
-            snprintf(out + j, 4, "%%%02X", c);
+            int n = snprintf(out + j, 4, "%%%02X", c);
+            if (n != 3) { free(out); return NULL; }
             j += 3;
         }
     }
@@ -310,53 +350,54 @@ static char *url_encode(const char *s) {
     return out;
 }
 
-// ------------------------------
-// Deterministic ID generator: sanitized filename + "_" + SHA-256 hex
-// ------------------------------
+/* ------------------------------
+ * Deterministic ID generator:
+ * sanitized filename + "_" + sha256hex(filename)
+ * ------------------------------ */
+
 static char *make_deterministic_id(const char *filename) {
     size_t len = strlen(filename);
 
-    char *san = malloc(len * 2 + 1);
+    /* sanitized: replace non-alnum with '_' and lowercase */
+    char *san = malloc(len + 1);
     if (!san) return NULL;
-
     size_t j = 0;
-    for (size_t i = 0; i < len; i++) {
+    for (size_t i = 0; i < len; ++i) {
         unsigned char c = (unsigned char)filename[i];
-        if (isalnum(c))
-            san[j++] = (char)tolower(c);
-        else
-            san[j++] = '_';
+        if (isalnum(c)) san[j++] = (char)tolower(c);
+        else san[j++] = '_';
     }
-    san[j] = 0;
+    san[j] = '\0';
 
+    /* compute sha256 of the original filename bytes */
     uint8_t hash[32];
     sha256_bytes((const uint8_t *)filename, len, hash);
 
+    /* hex encode */
     char hash_hex[65];
-    for (int i = 0; i < 32; i++)
-        snprintf(hash_hex + i * 2, 3, "%02x", hash[i]);
-    hash_hex[64] = 0;
+    for (int i = 0; i < 32; ++i) {
+        snprintf(hash_hex + i*2, 3, "%02x", hash[i]);
+    }
+    hash_hex[64] = '\0';
 
+    /* final id: san + "_" + hash_hex */
     size_t out_len = strlen(san) + 1 + 64 + 1;
     char *out = malloc(out_len);
-    if (!out) {
-        free(san);
-        return NULL;
-    }
-
+    if (!out) { free(san); return NULL; }
     snprintf(out, out_len, "%s_%s", san, hash_hex);
     free(san);
     return out;
 }
 
-// ------------------------------
-// Config file loader
-// ------------------------------
-int load_config_file(const char *path,
-                     char *user_buf, size_t user_sz,
-                     char *pass_buf, size_t pass_sz,
-                     char *host_buf, size_t host_sz,
-                     char *name_buf, size_t name_sz)
+/* ------------------------------
+ * Config file loader
+ * ------------------------------ */
+
+static int load_config_file(const char *path,
+                            char *user_buf, size_t user_sz,
+                            char *pass_buf, size_t pass_sz,
+                            char *host_buf, size_t host_sz,
+                            char *name_buf, size_t name_sz)
 {
     FILE *fp = fopen(path, "r");
     if (!fp) {
@@ -366,54 +407,50 @@ int load_config_file(const char *path,
 
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
-
         char *nl = strchr(line, '\n');
-        if (nl) *nl = 0;
-
-        if (strlen(line) < 3)
-            continue;
+        if (nl) *nl = '\0';
+        if (strlen(line) < 3) continue;
 
         char *eq = strchr(line, '=');
         if (!eq) continue;
 
-        *eq = 0;
+        *eq = '\0';
         char *key = line;
         char *val = eq + 1;
 
         if (val[0] != '"') {
-            fprintf(stderr, "Malformed config line: %s\n", line);
+            fprintf(stderr, "Malformed config line (missing opening quote): %s\n", line);
             fclose(fp);
             return 0;
         }
 
         char *end = strrchr(val, '"');
         if (!end || end == val) {
-            fprintf(stderr, "Malformed config line: %s\n", line);
+            fprintf(stderr, "Malformed config line (missing closing quote): %s\n", line);
             fclose(fp);
             return 0;
         }
 
-        size_t len = end - (val + 1);
-
+        size_t len = (size_t)(end - (val + 1));
         if (strcmp(key, "db_usr") == 0) {
             if (len >= user_sz) len = user_sz - 1;
             memcpy(user_buf, val + 1, len);
-            user_buf[len] = 0;
-        }
-        else if (strcmp(key, "db_passwd") == 0) {
+            user_buf[len] = '\0';
+        } else if (strcmp(key, "db_passwd") == 0) {
             if (len >= pass_sz) len = pass_sz - 1;
             memcpy(pass_buf, val + 1, len);
-            pass_buf[len] = 0;
-        }
-        else if (strcmp(key, "db_hst") == 0) {
+            pass_buf[len] = '\0';
+        } else if (strcmp(key, "db_hst") == 0) {
             if (len >= host_sz) len = host_sz - 1;
             memcpy(host_buf, val + 1, len);
-            host_buf[len] = 0;
-        }
-        else if (strcmp(key, "db_name") == 0) {
+            host_buf[len] = '\0';
+        } else if (strcmp(key, "db_name") == 0) {
             if (len >= name_sz) len = name_sz - 1;
             memcpy(name_buf, val + 1, len);
-            name_buf[len] = 0;
+            name_buf[len] = '\0';
+        } else {
+            /* unknown key: ignore but warn */
+            fprintf(stderr, "Warning: unknown config key: %s\n", key);
         }
     }
 
@@ -421,10 +458,11 @@ int load_config_file(const char *path,
     return 1;
 }
 
-// ------------------------------
-// Upload attachment
-// ------------------------------
-int upload_attachment(const char *filepath) {
+/* ------------------------------
+ * Upload attachment
+ * ------------------------------ */
+
+static int upload_attachment(const char *filepath) {
     size_t filesize;
     unsigned char *filedata = read_file_binary(filepath, &filesize);
     if (!filedata) {
@@ -464,9 +502,14 @@ int upload_attachment(const char *filepath) {
         }
     }
 
-    size_t json_size = strlen(b64) + strlen(escaped_name) + 300;
-    if (det_id)
-        json_size += strlen(det_id);
+    /* Conservative JSON sizing:
+     * - base64 length
+     * - escaped filename length
+     * - if deterministic: include _id length
+     * - add headroom for JSON punctuation
+     */
+    size_t json_size = strlen(b64) + strlen(escaped_name) + 512;
+    if (det_id) json_size += strlen(det_id) + 64;
 
     char *json = malloc(json_size);
     if (!json) {
@@ -478,30 +521,58 @@ int upload_attachment(const char *filepath) {
     }
 
     if (USE_DETERMINISTIC_ID) {
-        snprintf(json, json_size,
+        /* include _id field */
+        int n = snprintf(json, json_size,
             "{ \"_id\": \"%s\", \"_attachments\": { \"%s\": { \"content_type\": \"application/octet-stream\", \"data\": \"%s\" } } }",
-            det_id, escaped_name, b64
-        );
+            det_id, escaped_name, b64);
+        if (n < 0 || (size_t)n >= json_size) {
+            fprintf(stderr, "JSON construction overflow\n");
+            free(json);
+            free(b64);
+            free(escaped_name);
+            free(det_id);
+            free(det_id_url);
+            return 1;
+        }
     } else {
-        snprintf(json, json_size,
+        int n = snprintf(json, json_size,
             "{ \"_attachments\": { \"%s\": { \"content_type\": \"application/octet-stream\", \"data\": \"%s\" } } }",
-            escaped_name, b64
-        );
+            escaped_name, b64);
+        if (n < 0 || (size_t)n >= json_size) {
+            fprintf(stderr, "JSON construction overflow\n");
+            free(json);
+            free(b64);
+            free(escaped_name);
+            return 1;
+        }
     }
 
     free(b64);
     free(escaped_name);
 
-    char url[1024];
+    char url[2048];
     size_t hlen = strlen(DB_HOST);
     const char *sep = (hlen > 0 && DB_HOST[hlen - 1] == '/') ? "" : "/";
 
     if (USE_DETERMINISTIC_ID) {
-        snprintf(url, sizeof(url), "%s%s%s/%s", DB_HOST, sep, DB_NAME, det_id_url);
+        /* PUT to DB/ID */
+        if (snprintf(url, sizeof(url), "%s%s%s/%s", DB_HOST, sep, DB_NAME, det_id_url) >= (int)sizeof(url)) {
+            fprintf(stderr, "URL too long\n");
+            free(json);
+            free(det_id);
+            free(det_id_url);
+            return 1;
+        }
     } else {
-        snprintf(url, sizeof(url), "%s%s%s", DB_HOST, sep, DB_NAME);
+        /* POST to DB */
+        if (snprintf(url, sizeof(url), "%s%s%s", DB_HOST, sep, DB_NAME) >= (int)sizeof(url)) {
+            fprintf(stderr, "URL too long\n");
+            free(json);
+            return 1;
+        }
     }
 
+    /* free det_id_url/det_id now that url is built */
     free(det_id_url);
     free(det_id);
 
@@ -520,13 +591,19 @@ int upload_attachment(const char *filepath) {
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
 
+    /* timeouts to avoid hung workers */
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+
     if (USE_DETERMINISTIC_ID)
         curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
     else
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
 
-    curl_easy_setopt(curl, CURLOPT_USERNAME, DB_USER);
-    curl_easy_setopt(curl, CURLOPT_PASSWORD, DB_PASS);
+    if (DB_USER && DB_PASS) {
+        curl_easy_setopt(curl, CURLOPT_USERNAME, DB_USER);
+        curl_easy_setopt(curl, CURLOPT_PASSWORD, DB_PASS);
+    }
 
     CURLcode res = curl_easy_perform(curl);
 
@@ -542,25 +619,26 @@ int upload_attachment(const char *filepath) {
     return 0;
 }
 
-// ------------------------------
-// Work queue for parallel uploads
-// ------------------------------
+/* ------------------------------
+ * Work queue for parallel uploads
+ * ------------------------------ */
+
 typedef struct job {
     char *path;
     struct job *next;
 } job_t;
 
-job_t *queue_head = NULL;
-job_t *queue_tail = NULL;
+static job_t *queue_head = NULL;
+static job_t *queue_tail = NULL;
 
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
-int workers_running = 1;
+static int workers_running = 1;
 
-// Push job
-void queue_push(const char *path) {
+static void queue_push(const char *path) {
     job_t *j = malloc(sizeof(job_t));
+    if (!j) return;
     j->path = strdup(path);
     j->next = NULL;
 
@@ -574,10 +652,8 @@ void queue_push(const char *path) {
     pthread_mutex_unlock(&queue_mutex);
 }
 
-// Pop job
-char *queue_pop() {
+static char *queue_pop(void) {
     pthread_mutex_lock(&queue_mutex);
-
     while (workers_running && queue_head == NULL)
         pthread_cond_wait(&queue_cond, &queue_mutex);
 
@@ -589,7 +665,6 @@ char *queue_pop() {
     job_t *j = queue_head;
     queue_head = j->next;
     if (!queue_head) queue_tail = NULL;
-
     pthread_mutex_unlock(&queue_mutex);
 
     char *path = j->path;
@@ -597,38 +672,46 @@ char *queue_pop() {
     return path;
 }
 
-// Worker thread
-void *worker_thread(void *arg) {
+static void *worker_thread(void *arg) {
     (void)arg;
-
     while (1) {
         char *path = queue_pop();
         if (!path) break;
-
         upload_attachment(path);
         free(path);
     }
     return NULL;
 }
 
-// ------------------------------
-// Recursive directory walker
-// ------------------------------
-int upload_recursive_parallel(const char *root, int threads) {
+/* ------------------------------
+ * Recursive directory walker
+ * ------------------------------ */
 
+static int upload_recursive_parallel(const char *root, int threads) {
     if (threads < 1 || threads > MAX_THREADS) {
         fprintf(stderr, "Invalid thread count (max %d)\n", MAX_THREADS);
         return 1;
     }
 
-    pthread_t *tids = malloc(sizeof(pthread_t) * threads);
+    pthread_t *tids = malloc(sizeof(pthread_t) * (size_t)threads);
     if (!tids) {
         fprintf(stderr, "Failed to allocate thread array\n");
         return 1;
     }
 
-    for (int i = 0; i < threads; i++)
-        pthread_create(&tids[i], NULL, worker_thread, NULL);
+    for (int i = 0; i < threads; ++i) {
+        if (pthread_create(&tids[i], NULL, worker_thread, NULL) != 0) {
+            fprintf(stderr, "Failed to create thread %d\n", i);
+            /* signal shutdown to already created threads */
+            pthread_mutex_lock(&queue_mutex);
+            workers_running = 0;
+            pthread_cond_broadcast(&queue_cond);
+            pthread_mutex_unlock(&queue_mutex);
+            for (int j = 0; j < i; ++j) pthread_join(tids[j], NULL);
+            free(tids);
+            return 1;
+        }
+    }
 
     char *paths[] = { (char *)root, NULL };
     FTS *fts = fts_open(paths, FTS_NOCHDIR | FTS_PHYSICAL, NULL);
@@ -638,16 +721,16 @@ int upload_recursive_parallel(const char *root, int threads) {
         workers_running = 0;
         pthread_cond_broadcast(&queue_cond);
         pthread_mutex_unlock(&queue_mutex);
-        for (int i = 0; i < threads; i++)
-            pthread_join(tids[i], NULL);
+        for (int i = 0; i < threads; ++i) pthread_join(tids[i], NULL);
         free(tids);
         return 1;
     }
 
     FTSENT *ent;
     while ((ent = fts_read(fts)) != NULL) {
-        if (ent->fts_info == FTS_F)
+        if (ent->fts_info == FTS_F) {
             queue_push(ent->fts_path);
+        }
     }
 
     fts_close(fts);
@@ -657,22 +740,21 @@ int upload_recursive_parallel(const char *root, int threads) {
     pthread_cond_broadcast(&queue_cond);
     pthread_mutex_unlock(&queue_mutex);
 
-    for (int i = 0; i < threads; i++)
-        pthread_join(tids[i], NULL);
-
+    for (int i = 0; i < threads; ++i) pthread_join(tids[i], NULL);
     free(tids);
     return 0;
 }
 
-// ------------------------------
-// Main
-// ------------------------------
+/* ------------------------------
+ * Main
+ * ------------------------------ */
+
 int main(int argc, char *argv[]) {
     static char user_buf[256], pass_buf[256], host_buf[512], name_buf[256];
 
     int argi = 1;
 
-    // CONFIG MODE FIRST
+    /* CONFIG MODE FIRST */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
         if (!load_config_file(argv[2],
                               user_buf, sizeof(user_buf),
@@ -695,7 +777,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // STRICT ARGUMENT MODE
+    /* STRICT ARGUMENT MODE */
     if (argi == 1) {
         if (argc < 7) {
             printf("Usage:\n");
@@ -723,12 +805,12 @@ int main(int argc, char *argv[]) {
         argi = 5;
     }
 
-    // Parse -n after credentials are known
-    for (int i = argi; i < argc; i++) {
+    /* Parse -n after credentials are known */
+    for (int i = argi; i < argc; ++i) {
         if (strcmp(argv[i], "-n") == 0) {
             USE_DETERMINISTIC_ID = 1;
-            for (int j = i; j < argc - 1; j++)
-                argv[j] = argv[j + 1];
+            /* remove -n from argv so later arg counting works */
+            for (int j = i; j < argc - 1; ++j) argv[j] = argv[j + 1];
             argc--;
             break;
         }
@@ -739,16 +821,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int ret;
+    int ret = 1;
 
-    // SINGLE FILE MODE
+    /* SINGLE FILE MODE */
     if (argc - argi == 1) {
         ret = upload_attachment(argv[argi]);
         curl_global_cleanup();
         return ret;
     }
 
-    // PARALLEL RECURSIVE MODE
+    /* PARALLEL RECURSIVE MODE */
     if (argc - argi == 4 &&
         strcmp(argv[argi], "-p") == 0 &&
         strcmp(argv[argi + 2], "-r") == 0) {
