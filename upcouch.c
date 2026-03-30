@@ -84,14 +84,14 @@ const char *DB_HOST;
 const char *DB_NAME;
 
 // ------------------------------
-// Safe argument parser
+// Safe argument parser (NO exit())
 // ------------------------------
-void extract_value(const char *arg, const char *prefix, char *out, size_t outsz) {
+int extract_value(const char *arg, const char *prefix, char *out, size_t outsz) {
     size_t plen = strlen(prefix);
 
     if (strncmp(arg, prefix, plen) != 0) {
         fprintf(stderr, "Invalid argument: %s\n", arg);
-        exit(1);
+        return 0;
     }
 
     const char *start = arg + plen;
@@ -99,7 +99,7 @@ void extract_value(const char *arg, const char *prefix, char *out, size_t outsz)
 
     if (!end || end <= start) {
         fprintf(stderr, "Malformed argument: %s\n", arg);
-        exit(1);
+        return 0;
     }
 
     size_t len = end - start;
@@ -107,6 +107,8 @@ void extract_value(const char *arg, const char *prefix, char *out, size_t outsz)
 
     memcpy(out, start, len);
     out[len] = 0;
+
+    return 1;
 }
 
 // ------------------------------
@@ -114,7 +116,6 @@ void extract_value(const char *arg, const char *prefix, char *out, size_t outsz)
 // ------------------------------
 static char *json_escape_string(const char *s) {
     size_t len = strlen(s);
-    /* Worst case: every char becomes \u00XX (6 chars) */
     size_t max_out = len * 6 + 1;
     char *out = malloc(max_out);
     if (!out) return NULL;
@@ -126,7 +127,6 @@ static char *json_escape_string(const char *s) {
             out[j++] = '\\';
             out[j++] = c;
         } else if (c < 0x20) {
-            /* Control characters as \u00XX */
             snprintf(out + j, max_out - j, "\\u%04x", c);
             j += 6;
         } else {
@@ -138,7 +138,7 @@ static char *json_escape_string(const char *s) {
 }
 
 // ------------------------------
-// Config file loader (quoted values)
+// Config file loader
 // ------------------------------
 int load_config_file(const char *path,
                      char *user_buf, size_t user_sz,
@@ -169,14 +169,14 @@ int load_config_file(const char *path,
         char *val = eq + 1;
 
         if (val[0] != '"') {
-            fprintf(stderr, "Malformed config line (missing opening quote): %s\n", line);
+            fprintf(stderr, "Malformed config line: %s\n", line);
             fclose(fp);
             return 0;
         }
 
         char *end = strrchr(val, '"');
         if (!end || end == val) {
-            fprintf(stderr, "Malformed config line (missing closing quote): %s\n", line);
+            fprintf(stderr, "Malformed config line: %s\n", line);
             fclose(fp);
             return 0;
         }
@@ -344,7 +344,7 @@ char *queue_pop() {
 
 // Worker thread
 void *worker_thread(void *arg) {
-    (void)arg;   // suppress unused parameter warning
+    (void)arg;
 
     while (1) {
         char *path = queue_pop();
@@ -410,7 +410,7 @@ int upload_recursive_parallel(const char *root, int threads) {
 }
 
 // ------------------------------
-// Main (supports config + all modes)
+// Main
 // ------------------------------
 int main(int argc, char *argv[]) {
     static char user_buf[256], pass_buf[256], host_buf[512], name_buf[256];
@@ -440,7 +440,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // If not config mode, expect strict arguments
+    // STRICT ARGUMENT MODE
     if (argi == 1) {
         if (argc < 7) {
             printf("Usage:\n");
@@ -450,10 +450,14 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        extract_value(argv[1], "db_usr=\"", user_buf, sizeof(user_buf));
-        extract_value(argv[2], "db_passwd=\"", pass_buf, sizeof(pass_buf));
-        extract_value(argv[3], "db_hst=\"", host_buf, sizeof(host_buf));
-        extract_value(argv[4], "db_name=\"", name_buf, sizeof(name_buf));
+        if (!extract_value(argv[1], "db_usr=\"", user_buf, sizeof(user_buf)) ||
+            !extract_value(argv[2], "db_passwd=\"", pass_buf, sizeof(pass_buf)) ||
+            !extract_value(argv[3], "db_hst=\"", host_buf, sizeof(host_buf)) ||
+            !extract_value(argv[4], "db_name=\"", name_buf, sizeof(name_buf))) {
+
+            fprintf(stderr, "Argument parsing failed\n");
+            return 1;
+        }
 
         DB_USER = user_buf;
         DB_PASS = pass_buf;
