@@ -110,6 +110,34 @@ void extract_value(const char *arg, const char *prefix, char *out, size_t outsz)
 }
 
 // ------------------------------
+// JSON string escaper (for filenames)
+// ------------------------------
+static char *json_escape_string(const char *s) {
+    size_t len = strlen(s);
+    /* Worst case: every char becomes \u00XX (6 chars) */
+    size_t max_out = len * 6 + 1;
+    char *out = malloc(max_out);
+    if (!out) return NULL;
+
+    size_t i, j = 0;
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            out[j++] = '\\';
+            out[j++] = c;
+        } else if (c < 0x20) {
+            /* Control characters as \u00XX */
+            snprintf(out + j, max_out - j, "\\u%04x", c);
+            j += 6;
+        } else {
+            out[j++] = c;
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
+// ------------------------------
 // Config file loader (quoted values)
 // ------------------------------
 int load_config_file(const char *path,
@@ -199,16 +227,32 @@ int upload_attachment(const char *filepath) {
     const char *filename = strrchr(filepath, '/');
     filename = filename ? filename + 1 : filepath;
 
-    size_t json_size = strlen(b64) + strlen(filename) + 200;
+    char *escaped_name = json_escape_string(filename);
+    if (!escaped_name) {
+        free(b64);
+        return 1;
+    }
+
+    size_t json_size = strlen(b64) + strlen(escaped_name) + 200;
     char *json = malloc(json_size);
+    if (!json) {
+        free(b64);
+        free(escaped_name);
+        return 1;
+    }
+
     snprintf(json, json_size,
         "{ \"_attachments\": { \"%s\": { \"content_type\": \"application/octet-stream\", \"data\": \"%s\" } } }",
-        filename, b64
+        escaped_name, b64
     );
+
     free(b64);
+    free(escaped_name);
 
     char url[1024];
-    snprintf(url, sizeof(url), "%s/%s", DB_HOST, DB_NAME);
+    size_t hlen = strlen(DB_HOST);
+    const char *sep = (hlen > 0 && DB_HOST[hlen - 1] == '/') ? "" : "/";
+    snprintf(url, sizeof(url), "%s%s%s", DB_HOST, sep, DB_NAME);
 
     printf("Uploading: %s\n", filepath);
 
@@ -323,13 +367,27 @@ int upload_recursive_parallel(const char *root, int threads) {
     }
 
     pthread_t *tids = malloc(sizeof(pthread_t) * threads);
+    if (!tids) {
+        fprintf(stderr, "Failed to allocate thread array\n");
+        return 1;
+    }
 
     for (int i = 0; i < threads; i++)
         pthread_create(&tids[i], NULL, worker_thread, NULL);
 
     char *paths[] = { (char *)root, NULL };
     FTS *fts = fts_open(paths, FTS_NOCHDIR | FTS_PHYSICAL, NULL);
-    if (!fts) return 1;
+    if (!fts) {
+        fprintf(stderr, "fts_open failed\n");
+        pthread_mutex_lock(&queue_mutex);
+        workers_running = 0;
+        pthread_cond_broadcast(&queue_cond);
+        pthread_mutex_unlock(&queue_mutex);
+        for (int i = 0; i < threads; i++)
+            pthread_join(tids[i], NULL);
+        free(tids);
+        return 1;
+    }
 
     FTSENT *ent;
     while ((ent = fts_read(fts)) != NULL) {
@@ -405,9 +463,18 @@ int main(int argc, char *argv[]) {
         argi = 5;
     }
 
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+        fprintf(stderr, "curl_global_init failed\n");
+        return 1;
+    }
+
+    int ret;
+
     // SINGLE FILE MODE
     if (argc - argi == 1) {
-        return upload_attachment(argv[argi]);
+        ret = upload_attachment(argv[argi]);
+        curl_global_cleanup();
+        return ret;
     }
 
     // PARALLEL RECURSIVE MODE
@@ -416,9 +483,12 @@ int main(int argc, char *argv[]) {
         strcmp(argv[argi + 2], "-r") == 0) {
 
         int threads = atoi(argv[argi + 1]);
-        return upload_recursive_parallel(argv[argi + 3], threads);
+        ret = upload_recursive_parallel(argv[argi + 3], threads);
+        curl_global_cleanup();
+        return ret;
     }
 
     printf("Invalid arguments.\n");
+    curl_global_cleanup();
     return 1;
 }
