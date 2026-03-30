@@ -109,12 +109,16 @@ upcouch 'db_usr="USER"' 'db_passwd="PASS"' 'db_hst="HOSTURL"' 'db_name="DBNAME"'
           -p 4 -r /home/youruser/
 ```
 
-### Using a config file
+### Use deterministic document IDs based on the filename with added sha256
 
--n
-    Use deterministic document IDs based on the filename.
+```sh
+./upcouch -c example.conf -n myfile.bin -> myfile_bin_sha256fsdicerti43456erge
+```
+ -n Use deterministic document IDs based on the filename.
     This causes uploads to use PUT instead of POST.
     Re-uploading the same filename overwrites the same document.
+
+### Using a config file
 
 upcouch can load all database parameters from a config file:
 
