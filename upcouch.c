@@ -95,6 +95,78 @@ void extract_value(const char *arg, const char *prefix, char *out, size_t outsz)
 }
 
 // ------------------------------
+// Config file loader (quoted values)
+// ------------------------------
+int load_config_file(const char *path,
+                     char *user_buf, size_t user_sz,
+                     char *pass_buf, size_t pass_sz,
+                     char *host_buf, size_t host_sz,
+                     char *name_buf, size_t name_sz)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "Cannot open config file: %s\n", path);
+        return 0;
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+
+        if (strlen(line) < 3)
+            continue;
+
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+
+        *eq = 0;
+        char *key = line;
+        char *val = eq + 1;
+
+        if (val[0] != '"') {
+            fprintf(stderr, "Malformed config line (missing opening quote): %s\n", line);
+            fclose(fp);
+            return 0;
+        }
+
+        char *end = strrchr(val, '"');
+        if (!end || end == val) {
+            fprintf(stderr, "Malformed config line (missing closing quote): %s\n", line);
+            fclose(fp);
+            return 0;
+        }
+
+        size_t len = end - (val + 1);
+
+        if (strcmp(key, "db_usr") == 0) {
+            if (len >= user_sz) len = user_sz - 1;
+            memcpy(user_buf, val + 1, len);
+            user_buf[len] = 0;
+        }
+        else if (strcmp(key, "db_passwd") == 0) {
+            if (len >= pass_sz) len = pass_sz - 1;
+            memcpy(pass_buf, val + 1, len);
+            pass_buf[len] = 0;
+        }
+        else if (strcmp(key, "db_hst") == 0) {
+            if (len >= host_sz) len = host_sz - 1;
+            memcpy(host_buf, val + 1, len);
+            host_buf[len] = 0;
+        }
+        else if (strcmp(key, "db_name") == 0) {
+            if (len >= name_sz) len = name_sz - 1;
+            memcpy(name_buf, val + 1, len);
+            name_buf[len] = 0;
+        }
+    }
+
+    fclose(fp);
+    return 1;
+}
+
+// ------------------------------
 // Upload attachment
 // ------------------------------
 int upload_attachment(const char *filepath) {
@@ -144,6 +216,7 @@ int upload_attachment(const char *filepath) {
 
     CURLcode res = curl_easy_perform(curl);
 
+    curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     free(json);
 
@@ -256,37 +329,71 @@ int upload_recursive_parallel(const char *root, int threads) {
 }
 
 // ------------------------------
-// Main (strict argument order)
+// Main (supports config + all modes)
 // ------------------------------
 int main(int argc, char *argv[]) {
-    if (argc < 7) {
-        printf("Usage:\n");
-        printf("  %s 'db_usr=\"user\"' 'db_passwd=\"pw\"' 'db_hst=\"url\"' 'db_name=\"dbname\"' <file>\n", argv[0]);
-        printf("  %s 'db_usr=\"user\"' 'db_passwd=\"pw\"' 'db_hst=\"url\"' 'db_name=\"dbname\"' -p N -r <folder>\n", argv[0]);
-        return 1;
-    }
-
     static char user_buf[256], pass_buf[256], host_buf[512], name_buf[256];
 
-    extract_value(argv[1], "db_usr=\"", user_buf, sizeof(user_buf));
-    extract_value(argv[2], "db_passwd=\"", pass_buf, sizeof(pass_buf));
-    extract_value(argv[3], "db_hst=\"", host_buf, sizeof(host_buf));
-    extract_value(argv[4], "db_name=\"", name_buf, sizeof(name_buf));
+    int argi = 1;
 
-    DB_USER = user_buf;
-    DB_PASS = pass_buf;
-    DB_HOST = host_buf;
-    DB_NAME = name_buf;
+    // CONFIG MODE FIRST
+    if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+        if (!load_config_file(argv[2],
+                              user_buf, sizeof(user_buf),
+                              pass_buf, sizeof(pass_buf),
+                              host_buf, sizeof(host_buf),
+                              name_buf, sizeof(name_buf))) {
+            return 1;
+        }
 
-    // Single file mode
-    if (argc == 7) {
-        return upload_attachment(argv[5]);
+        DB_USER = user_buf;
+        DB_PASS = pass_buf;
+        DB_HOST = host_buf;
+        DB_NAME = name_buf;
+
+        argi = 3;
+
+        if (argc == 3) {
+            printf("Loaded config from %s\n", argv[2]);
+            return 0;
+        }
     }
 
-    // Parallel recursive mode (argc == 9)
-    if (argc == 9 && strcmp(argv[5], "-p") == 0 && strcmp(argv[7], "-r") == 0) {
-        int threads = atoi(argv[6]);
-        return upload_recursive_parallel(argv[8], threads);
+    // If not config mode, expect strict arguments
+    if (argi == 1) {
+        if (argc < 7) {
+            printf("Usage:\n");
+            printf("  %s -c <configfile>\n", argv[0]);
+            printf("  %s 'db_usr=\"user\"' 'db_passwd=\"pw\"' 'db_hst=\"url\"' 'db_name=\"dbname\"' <file>\n", argv[0]);
+            printf("  %s 'db_usr=\"user\"' 'db_passwd=\"pw\"' 'db_hst=\"url\"' 'db_name=\"dbname\"' -p N -r <folder>\n", argv[0]);
+            return 1;
+        }
+
+        extract_value(argv[1], "db_usr=\"", user_buf, sizeof(user_buf));
+        extract_value(argv[2], "db_passwd=\"", pass_buf, sizeof(pass_buf));
+        extract_value(argv[3], "db_hst=\"", host_buf, sizeof(host_buf));
+        extract_value(argv[4], "db_name=\"", name_buf, sizeof(name_buf));
+
+        DB_USER = user_buf;
+        DB_PASS = pass_buf;
+        DB_HOST = host_buf;
+        DB_NAME = name_buf;
+
+        argi = 5;
+    }
+
+    // SINGLE FILE MODE
+    if (argc - argi == 1) {
+        return upload_attachment(argv[argi]);
+    }
+
+    // PARALLEL RECURSIVE MODE
+    if (argc - argi == 4 &&
+        strcmp(argv[argi], "-p") == 0 &&
+        strcmp(argv[argi + 2], "-r") == 0) {
+
+        int threads = atoi(argv[argi + 1]);
+        return upload_recursive_parallel(argv[argi + 3], threads);
     }
 
     printf("Invalid arguments.\n");

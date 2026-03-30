@@ -102,6 +102,19 @@ upcouch 'db_usr="USER"' 'db_passwd="PASS"' 'db_hst="HOSTURL"' 'db_name="DBNAME"'
           -p 4 -r /home/youruser/
 ```
 
+### Using a config file
+
+upcouch can load all database parameters from a config file:
+
+    upcouch -c sample.conf
+
+Example config file:
+
+    db_usr="admin"
+    db_passwd="passwd"
+    db_hst="http://127.0.0.1:5984"
+    db_name="mydb"
+
 ---
 
 ## ⚠️ Notes
