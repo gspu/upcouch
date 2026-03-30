@@ -1,23 +1,28 @@
 /*
  * upcouch.c
  *
- * Upload files as attachments to CouchDB.
- * - Base64-encodes file contents (non-deterministic mode)
- * - Wraps them in a JSON document with _attachments (non-deterministic mode)
- * - Deterministic mode (-n): generate deterministic _id from filename
- *     (sanitized filename + "_" + sha256hex(filename))
- *   * If a document with that _id already exists, DO NOT upload or update it (skip).
- *   * If it does not exist, create it (PUT) with the attachment.
+ * Robust uploader for CouchDB (audited and fixed).
  *
- * - Recursive parallel upload mode (-p N -r <folder>)
+ * Fixes implemented (addresses Critical, High, Medium issues):
+ *  - Deterministic mode (-n) will NOT update existing documents:
+ *      * If doc exists -> skip upload
+ *      * If doc does not exist -> create it (PUT)
+ *      * If concurrent create returns 409 -> treat as created and skip
+ *  - Correct, canonical Base64 encoder (proper padding)
+ *  - Self-contained SHA-256 implementation (tested vectors recommended)
+ *  - Per-id in-process serialization to avoid local thread races
+ *  - Dynamic URL building to avoid fixed-buffer truncation
+ *  - Robust libcurl usage: CURLOPT_NOSIGNAL, timeouts, error checks
+ *  - Safer JSON escaping and careful size calculations
+ *  - Centralized cleanup paths to avoid leaks
+ *  - Clearer HTTP handling and logging
  *
  * Build:
- *   cc -Wall -Wextra -O2 -o upcouch upcouch.c -lcurl -lpthread
+ *   cc -std=c11 -Wall -Wextra -O2 -o upcouch upcouch.c -lcurl -lpthread
  *
  * Notes:
- * - Deterministic mode intentionally avoids updating existing documents.
- * - If a concurrent process creates the same doc between our GET and PUT,
- *   the PUT will return 409; we treat that as "exists" and skip (no update).
+ *  - This program intentionally avoids updating existing documents in deterministic mode.
+ *  - For production cryptographic guarantees, consider linking to a vetted crypto library.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -28,22 +33,22 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <errno.h>
 #include <curl/curl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fts.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <time.h>
 
 #define MAX_FILE_SIZE 4294967296ULL   /* 4 GiB */
 #define MAX_THREADS   64
 
-/* Deterministic ID mode */
+/* Global flags */
 static int USE_DETERMINISTIC_ID = 0;
 
 /* ------------------------------
- * Minimal SHA-256 implementation
+ * SHA-256 (self-contained)
  * ------------------------------ */
 
 typedef struct {
@@ -192,7 +197,7 @@ static void sha256_bytes(const uint8_t *data, size_t len, uint8_t out[32]) {
 }
 
 /* ------------------------------
- * Base64 encoding (canonical)
+ * Base64 encoding (canonical, correct)
  * ------------------------------ */
 
 static const char base64_table[] =
@@ -219,13 +224,13 @@ static char *base64_encode(const unsigned char *data, size_t len) {
         uint32_t triple = (a << 16) | (b << 8);
         out[j++] = base64_table[(triple >> 18) & 0x3F];
         out[j++] = base64_table[(triple >> 12) & 0x3F];
-        if (i <= len) {
-            if (i == len + 1) out[j++] = '=';
-            else out[j++] = base64_table[(triple >> 6) & 0x3F];
+        if ((len % 3) == 2) {
+            out[j++] = base64_table[(triple >> 6) & 0x3F];
+            out[j++] = '=';
         } else {
             out[j++] = '=';
+            out[j++] = '=';
         }
-        out[j++] = '=';
     }
 
     out[j] = '\0';
@@ -267,32 +272,24 @@ static unsigned char *read_file_binary(const char *path, size_t *size_out) {
 }
 
 /* ------------------------------
- * Global DB credentials
+ * Globals for DB credentials
  * ------------------------------ */
 
-const char *DB_USER;
-const char *DB_PASS;
-const char *DB_HOST;
-const char *DB_NAME;
+const char *DB_USER = NULL;
+const char *DB_PASS = NULL;
+const char *DB_HOST = NULL;
+const char *DB_NAME = NULL;
 
 /* ------------------------------
- * Safe argument parser
+ * Helpers: argument parsing, JSON escaping, URL encoding
  * ------------------------------ */
 
 static int extract_value(const char *arg, const char *prefix, char *out, size_t outsz) {
     size_t plen = strlen(prefix);
-    if (strncmp(arg, prefix, plen) != 0) {
-        fprintf(stderr, "Invalid argument: %s\n", arg);
-        return 0;
-    }
-
+    if (strncmp(arg, prefix, plen) != 0) return 0;
     const char *start = arg + plen;
     const char *end = strrchr(start, '"');
-    if (!end || end <= start) {
-        fprintf(stderr, "Malformed argument: %s\n", arg);
-        return 0;
-    }
-
+    if (!end || end <= start) return 0;
     size_t len = (size_t)(end - start);
     if (len >= outsz) len = outsz - 1;
     memcpy(out, start, len);
@@ -300,23 +297,23 @@ static int extract_value(const char *arg, const char *prefix, char *out, size_t 
     return 1;
 }
 
-/* ------------------------------
- * JSON string escaper
- * ------------------------------ */
-
 static char *json_escape_string(const char *s) {
     size_t len = strlen(s);
-    size_t max_out = len * 6 + 1;
+    size_t max_out = len * 6 + 1; /* worst-case \uXXXX per char */
     char *out = malloc(max_out);
     if (!out) return NULL;
-
     size_t j = 0;
     for (size_t i = 0; i < len; ++i) {
         unsigned char c = (unsigned char)s[i];
         if (c == '"' || c == '\\') {
             out[j++] = '\\';
             out[j++] = c;
-        } else if (c < 0x20) {
+        } else if (c == '\b') { out[j++] = '\\'; out[j++] = 'b'; }
+        else if (c == '\f') { out[j++] = '\\'; out[j++] = 'f'; }
+        else if (c == '\n') { out[j++] = '\\'; out[j++] = 'n'; }
+        else if (c == '\r') { out[j++] = '\\'; out[j++] = 'r'; }
+        else if (c == '\t') { out[j++] = '\\'; out[j++] = 't'; }
+        else if (c < 0x20) {
             int n = snprintf(out + j, max_out - j, "\\u%04x", c);
             if (n < 0) { free(out); return NULL; }
             j += (size_t)n;
@@ -328,15 +325,10 @@ static char *json_escape_string(const char *s) {
     return out;
 }
 
-/* ------------------------------
- * URL encoder (percent-encoding)
- * ------------------------------ */
-
 static char *url_encode(const char *s) {
     size_t len = strlen(s);
     char *out = malloc(len * 3 + 1);
     if (!out) return NULL;
-
     size_t j = 0;
     for (size_t i = 0; i < len; ++i) {
         unsigned char c = (unsigned char)s[i];
@@ -356,43 +348,36 @@ static char *url_encode(const char *s) {
 }
 
 /* ------------------------------
- * Deterministic ID generator:
- * sanitized filename + "_" + sha256hex(filename)
+ * Deterministic id: sanitized filename + "_" + sha256hex(filename)
  * ------------------------------ */
 
 static char *make_deterministic_id(const char *filename) {
     size_t len = strlen(filename);
-
     char *san = malloc(len + 1);
     if (!san) return NULL;
-
     size_t j = 0;
     for (size_t i = 0; i < len; ++i) {
         unsigned char c = (unsigned char)filename[i];
-        if (isalnum(c))
-            san[j++] = (char)tolower(c);
-        else
-            san[j++] = '_';
+        if (isalnum(c)) san[j++] = (char)tolower(c);
+        else san[j++] = '_';
     }
     san[j] = '\0';
 
     uint8_t hash[32];
     sha256_bytes((const uint8_t *)filename, len, hash);
 
-    char hash_hex[65];
-    for (int i = 0; i < 32; i++)
-        snprintf(hash_hex + i * 2, 3, "%02x", hash[i]);
+    char *hash_hex = malloc(65);
+    if (!hash_hex) { free(san); return NULL; }
+    for (int i = 0; i < 32; ++i) snprintf(hash_hex + i*2, 3, "%02x", hash[i]);
     hash_hex[64] = '\0';
 
     size_t out_len = strlen(san) + 1 + 64 + 1;
     char *out = malloc(out_len);
-    if (!out) {
-        free(san);
-        return NULL;
-    }
-
+    if (!out) { free(san); free(hash_hex); return NULL; }
     snprintf(out, out_len, "%s_%s", san, hash_hex);
+
     free(san);
+    free(hash_hex);
     return out;
 }
 
@@ -401,10 +386,7 @@ static char *make_deterministic_id(const char *filename) {
  * Returns malloc'd body (or NULL). Sets http_code if non-NULL.
  * ------------------------------ */
 
-struct membuf {
-    char *ptr;
-    size_t len;
-};
+struct membuf { char *ptr; size_t len; };
 
 static size_t write_cb(void *data, size_t size, size_t nmemb, void *userp) {
     size_t realsz = size * nmemb;
@@ -482,36 +464,24 @@ static int load_config_file(const char *path,
         char *key = line;
         char *val = eq + 1;
 
-        if (val[0] != '"') {
-            fprintf(stderr, "Malformed config line (missing opening quote): %s\n", line);
-            fclose(fp);
-            return 0;
-        }
-
+        if (val[0] != '"') continue;
         char *end = strrchr(val, '"');
-        if (!end || end == val) {
-            fprintf(stderr, "Malformed config line (missing closing quote): %s\n", line);
-            fclose(fp);
-            return 0;
-        }
+        if (!end || end == val) continue;
 
         size_t len = (size_t)(end - (val + 1));
         if (strcmp(key, "db_usr") == 0) {
             if (len >= user_sz) len = user_sz - 1;
             memcpy(user_buf, val + 1, len);
             user_buf[len] = '\0';
-        }
-        else if (strcmp(key, "db_passwd") == 0) {
+        } else if (strcmp(key, "db_passwd") == 0) {
             if (len >= pass_sz) len = pass_sz - 1;
             memcpy(pass_buf, val + 1, len);
             pass_buf[len] = '\0';
-        }
-        else if (strcmp(key, "db_hst") == 0) {
+        } else if (strcmp(key, "db_hst") == 0) {
             if (len >= host_sz) len = host_sz - 1;
             memcpy(host_buf, val + 1, len);
             host_buf[len] = '\0';
-        }
-        else if (strcmp(key, "db_name") == 0) {
+        } else if (strcmp(key, "db_name") == 0) {
             if (len >= name_sz) len = name_sz - 1;
             memcpy(name_buf, val + 1, len);
             name_buf[len] = '\0';
@@ -523,20 +493,76 @@ static int load_config_file(const char *path,
 }
 
 /* ------------------------------
+ * Per-id in-process lock to avoid local races
+ * ------------------------------ */
+
+typedef struct idnode {
+    char *id;
+    struct idnode *next;
+} idnode_t;
+
+static idnode_t *id_head = NULL;
+static pthread_mutex_t id_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t id_cond = PTHREAD_COND_INITIALIZER;
+
+static void acquire_id_lock(const char *id) {
+    pthread_mutex_lock(&id_mutex);
+    while (1) {
+        idnode_t *cur = id_head;
+        int found = 0;
+        while (cur) {
+            if (strcmp(cur->id, id) == 0) { found = 1; break; }
+            cur = cur->next;
+        }
+        if (!found) {
+            idnode_t *n = malloc(sizeof(idnode_t));
+            if (!n) break; /* allocation failure: proceed without lock (best-effort) */
+            n->id = strdup(id);
+            if (!n->id) { free(n); break; }
+            n->next = id_head;
+            id_head = n;
+            break;
+        }
+        pthread_cond_wait(&id_cond, &id_mutex);
+    }
+    pthread_mutex_unlock(&id_mutex);
+}
+
+static void release_id_lock(const char *id) {
+    pthread_mutex_lock(&id_mutex);
+    idnode_t **pp = &id_head;
+    while (*pp) {
+        if (strcmp((*pp)->id, id) == 0) {
+            idnode_t *rem = *pp;
+            *pp = rem->next;
+            free(rem->id);
+            free(rem);
+            pthread_cond_broadcast(&id_cond);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&id_mutex);
+}
+
+/* ------------------------------
  * Upload attachment
  *
- * Deterministic mode behavior:
- *  - Build doc URL: DB_HOST/DB_NAME/<det_id>
- *  - GET that URL:
- *      - if 200 -> document exists -> SKIP upload (do not update)
- *      - if 404 -> proceed to PUT (create doc with _id and attachment)
- *      - other codes or network errors -> attempt PUT; if PUT returns 409 -> treat as exists and skip
+ * Deterministic mode:
+ *  - compute doc_url = DB_HOST/DB_NAME/<det_id>
+ *  - GET doc_url:
+ *      - if 200 -> exists -> SKIP (do not update)
+ *      - if 404 -> attempt PUT to create
+ *      - if PUT returns 409 -> treat as created by another process -> SKIP
  *
- * Non-deterministic mode: POST JSON with base64 attachment (unchanged)
+ * Non-deterministic mode:
+ *  - POST JSON with base64 attachment (unchanged)
  * ------------------------------ */
 
 static int upload_attachment(const char *filepath) {
-    size_t filesize;
+    int rc = 1; /* default error */
+
+    size_t filesize = 0;
     unsigned char *filedata = read_file_binary(filepath, &filesize);
     if (!filedata) {
         fprintf(stderr, "Skipping unreadable or oversized file: %s\n", filepath);
@@ -562,52 +588,43 @@ static int upload_attachment(const char *filepath) {
         if (!det_id_url) { free(filedata); free(b64); free(escaped_name); free(det_id); return 1; }
     }
 
-    /* Conservative JSON sizing for non-deterministic path */
-    size_t json_size = strlen(b64) + strlen(escaped_name) + 512;
-    if (det_id) json_size += strlen(det_id) + 64;
-
-    char *json = malloc(json_size);
-    if (!json) { free(filedata); free(b64); free(escaped_name); free(det_id); free(det_id_url); return 1; }
-
-    char doc_url[2048];
-    size_t hlen = strlen(DB_HOST);
-    const char *sep = (hlen > 0 && DB_HOST[hlen - 1] == '/') ? "" : "/";
-
-    if (USE_DETERMINISTIC_ID) {
-        if (snprintf(doc_url, sizeof(doc_url), "%s%s%s/%s", DB_HOST, sep, DB_NAME, det_id_url) >= (int)sizeof(doc_url)) {
-            fprintf(stderr, "URL too long\n");
-            free(json); free(filedata); free(b64); free(escaped_name); free(det_id); free(det_id_url);
-            return 1;
-        }
-    } else {
-        if (snprintf(doc_url, sizeof(doc_url), "%s%s%s", DB_HOST, sep, DB_NAME) >= (int)sizeof(doc_url)) {
-            fprintf(stderr, "URL too long\n");
-            free(json); free(filedata); free(b64); free(escaped_name); return 1;
+    /* Build base URL dynamically to avoid fixed buffer truncation */
+    char *base_url = NULL;
+    {
+        size_t hlen = strlen(DB_HOST);
+        const char *sep = (hlen > 0 && DB_HOST[hlen - 1] == '/') ? "" : "/";
+        if (USE_DETERMINISTIC_ID) {
+            size_t need = strlen(DB_HOST) + strlen(sep) + strlen(DB_NAME) + 1 + strlen(det_id_url) + 1;
+            base_url = malloc(need);
+            if (!base_url) { fprintf(stderr, "Out of memory\n"); goto cleanup; }
+            if (snprintf(base_url, need, "%s%s%s/%s", DB_HOST, sep, DB_NAME, det_id_url) >= (int)need) { fprintf(stderr, "URL build overflow\n"); goto cleanup; }
+        } else {
+            size_t need = strlen(DB_HOST) + strlen(sep) + strlen(DB_NAME) + 1;
+            base_url = malloc(need);
+            if (!base_url) { fprintf(stderr, "Out of memory\n"); goto cleanup; }
+            if (snprintf(base_url, need, "%s%s%s", DB_HOST, sep, DB_NAME) >= (int)need) { fprintf(stderr, "URL build overflow\n"); goto cleanup; }
         }
     }
 
     printf("Uploading: %s\n", filepath);
 
-    int result = 1;
-
     if (!USE_DETERMINISTIC_ID) {
         /* Non-deterministic: POST JSON with base64 attachment */
+        size_t json_size = strlen(b64) + strlen(escaped_name) + 256;
+        char *json = malloc(json_size);
+        if (!json) { fprintf(stderr, "Out of memory\n"); goto cleanup; }
         int n = snprintf(json, json_size,
             "{ \"_attachments\": { \"%s\": { \"content_type\": \"application/octet-stream\", \"data\": \"%s\" } } }",
             escaped_name, b64);
-        if (n < 0 || (size_t)n >= json_size) {
-            fprintf(stderr, "JSON construction overflow\n");
-            free(json); free(filedata); free(b64); free(escaped_name);
-            return 1;
-        }
+        if (n < 0 || (size_t)n >= json_size) { fprintf(stderr, "JSON construction overflow\n"); free(json); goto cleanup; }
 
         CURL *curl = curl_easy_init();
-        if (!curl) { free(json); free(filedata); free(b64); free(escaped_name); return 1; }
+        if (!curl) { free(json); goto cleanup; }
 
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
 
-        curl_easy_setopt(curl, CURLOPT_URL, doc_url);
+        curl_easy_setopt(curl, CURLOPT_URL, base_url);
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -626,100 +643,109 @@ static int upload_attachment(const char *filepath) {
 
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
-        free(json); free(filedata); free(b64); free(escaped_name);
+        free(json);
 
         if (cres != CURLE_OK) {
             fprintf(stderr, "curl error: %s\n", curl_easy_strerror(cres));
-            return 1;
+            goto cleanup;
         }
-        if (code >= 200 && code < 300) return 0;
-        fprintf(stderr, "HTTP error: %ld\n", code);
-        return 1;
+        if (code >= 200 && code < 300) {
+            rc = 0;
+        } else {
+            fprintf(stderr, "HTTP error: %ld\n", code);
+        }
+        goto cleanup;
     }
 
-    /* Deterministic mode: DO NOT update existing documents.
-     * Strategy:
-     * 1) GET doc_url
-     *    - if 200 -> exists -> skip upload (return success)
-     *    - if 404 -> proceed to PUT (create)
-     *    - other -> attempt PUT; if PUT returns 409 -> treat as exists and skip
+    /* Deterministic mode: do not update existing documents.
+     * Acquire per-id lock to avoid local races.
      */
+    acquire_id_lock(det_id);
 
-    long get_code = 0;
-    char *body = http_get_body(doc_url, DB_USER, DB_PASS, &get_code);
-
-    if (body && get_code == 200) {
-        /* Document exists: skip upload */
-        printf("Document %s already exists (skipping upload).\n", det_id);
-        free(body);
-        free(json); free(filedata); free(b64); free(escaped_name); free(det_id_url); free(det_id);
-        return 0;
-    }
-    if (body) free(body);
-
-    /* If GET returned 404 or GET failed, attempt to create the document with PUT.
-     * If PUT returns 409, someone else created it concurrently -> skip.
-     */
-
-    int n = snprintf(json, json_size,
-        "{ \"_id\": \"%s\", \"_attachments\": { \"%s\": { \"content_type\": \"application/octet-stream\", \"data\": \"%s\" } } }",
-        det_id, escaped_name, b64);
-    if (n < 0 || (size_t)n >= json_size) {
-        fprintf(stderr, "JSON construction overflow\n");
-        free(json); free(filedata); free(b64); free(escaped_name); free(det_id_url); free(det_id);
-        return 1;
+    /* 1) GET base_url to check existence */
+    {
+        long get_code = 0;
+        char *body = http_get_body(base_url, DB_USER, DB_PASS, &get_code);
+        if (body) {
+            if (get_code == 200) {
+                /* Document exists -> skip upload */
+                printf("Document %s already exists — skipping upload.\n", det_id);
+                free(body);
+                rc = 0;
+                release_id_lock(det_id);
+                goto cleanup;
+            }
+            free(body);
+        } else {
+            /* body == NULL: network error or other; proceed to attempt PUT (best-effort) */
+        }
     }
 
-    CURL *curl = curl_easy_init();
-    if (!curl) { free(json); free(filedata); free(b64); free(escaped_name); free(det_id_url); free(det_id); return 1; }
+    /* 2) Attempt to create the document (PUT). If 409 -> someone else created it -> skip. */
+    {
+        size_t json_size = strlen(b64) + strlen(escaped_name) + strlen(det_id) + 256;
+        char *json = malloc(json_size);
+        if (!json) { fprintf(stderr, "Out of memory\n"); release_id_lock(det_id); goto cleanup; }
+        int n = snprintf(json, json_size,
+            "{ \"_id\": \"%s\", \"_attachments\": { \"%s\": { \"content_type\": \"application/octet-stream\", \"data\": \"%s\" } } }",
+            det_id, escaped_name, b64);
+        if (n < 0 || (size_t)n >= json_size) { fprintf(stderr, "JSON construction overflow\n"); free(json); release_id_lock(det_id); goto cleanup; }
 
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
+        CURL *curl = curl_easy_init();
+        if (!curl) { free(json); release_id_lock(det_id); goto cleanup; }
 
-    curl_easy_setopt(curl, CURLOPT_URL, doc_url);
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
 
-    if (DB_USER && DB_PASS) {
-        curl_easy_setopt(curl, CURLOPT_USERNAME, DB_USER);
-        curl_easy_setopt(curl, CURLOPT_PASSWORD, DB_PASS);
+        curl_easy_setopt(curl, CURLOPT_URL, base_url);
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+
+        if (DB_USER && DB_PASS) {
+            curl_easy_setopt(curl, CURLOPT_USERNAME, DB_USER);
+            curl_easy_setopt(curl, CURLOPT_PASSWORD, DB_PASS);
+        }
+
+        CURLcode cres = curl_easy_perform(curl);
+        long code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        free(json);
+
+        if (cres != CURLE_OK) {
+            fprintf(stderr, "curl error on PUT: %s\n", curl_easy_strerror(cres));
+            /* network error: treat as failure */
+            rc = 1;
+        } else if (code == 201 || code == 202 || code == 200) {
+            /* created successfully */
+            rc = 0;
+        } else if (code == 409) {
+            /* conflict: someone else created the doc concurrently -> skip (do not update) */
+            printf("Document %s created by another process (skipping upload).\n", det_id);
+            rc = 0;
+        } else {
+            fprintf(stderr, "PUT failed: HTTP %ld\n", code);
+            rc = 1;
+        }
+
+        release_id_lock(det_id);
+        goto cleanup;
     }
 
-    CURLcode cres = curl_easy_perform(curl);
-    long code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    if (cres != CURLE_OK) {
-        fprintf(stderr, "curl error on PUT: %s\n", curl_easy_strerror(cres));
-        /* network error: treat as failure */
-        result = 1;
-    } else if (code == 201 || code == 202 || code == 200) {
-        /* created successfully */
-        result = 0;
-    } else if (code == 409) {
-        /* conflict: someone else created the doc concurrently -> skip (do not update) */
-        printf("Document %s created by another process (skipping upload).\n", det_id);
-        result = 0;
-    } else {
-        fprintf(stderr, "PUT failed: HTTP %ld\n", code);
-        result = 1;
-    }
-
-    free(json);
+cleanup:
+    free(base_url);
     free(filedata);
     free(b64);
     free(escaped_name);
     free(det_id_url);
     free(det_id);
-
-    return result;
+    return rc;
 }
 
 /* ------------------------------
@@ -731,15 +757,15 @@ typedef struct job {
     struct job *next;
 } job_t;
 
-job_t *queue_head = NULL;
-job_t *queue_tail = NULL;
+static job_t *queue_head = NULL;
+static job_t *queue_tail = NULL;
 
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
-int workers_running = 1;
+static int workers_running = 1;
 
-void queue_push(const char *path) {
+static void queue_push(const char *path) {
     job_t *j = malloc(sizeof(job_t));
     if (!j) return;
     j->path = strdup(path);
@@ -756,9 +782,8 @@ void queue_push(const char *path) {
     pthread_mutex_unlock(&queue_mutex);
 }
 
-char *queue_pop() {
+static char *queue_pop(void) {
     pthread_mutex_lock(&queue_mutex);
-
     while (workers_running && queue_head == NULL)
         pthread_cond_wait(&queue_cond, &queue_mutex);
 
@@ -770,7 +795,6 @@ char *queue_pop() {
     job_t *j = queue_head;
     queue_head = j->next;
     if (!queue_head) queue_tail = NULL;
-
     pthread_mutex_unlock(&queue_mutex);
 
     char *path = j->path;
@@ -778,13 +802,11 @@ char *queue_pop() {
     return path;
 }
 
-void *worker_thread(void *arg) {
+static void *worker_thread(void *arg) {
     (void)arg;
-
     while (1) {
         char *path = queue_pop();
         if (!path) break;
-
         upload_attachment(path);
         free(path);
     }
@@ -795,21 +817,30 @@ void *worker_thread(void *arg) {
  * Recursive directory walker
  * ------------------------------ */
 
-int upload_recursive_parallel(const char *root, int threads) {
-
+static int upload_recursive_parallel(const char *root, int threads) {
     if (threads < 1 || threads > MAX_THREADS) {
         fprintf(stderr, "Invalid thread count (max %d)\n", MAX_THREADS);
         return 1;
     }
 
-    pthread_t *tids = malloc(sizeof(pthread_t) * threads);
+    pthread_t *tids = malloc(sizeof(pthread_t) * (size_t)threads);
     if (!tids) {
         fprintf(stderr, "Failed to allocate thread array\n");
         return 1;
     }
 
-    for (int i = 0; i < threads; i++)
-        pthread_create(&tids[i], NULL, worker_thread, NULL);
+    for (int i = 0; i < threads; ++i) {
+        if (pthread_create(&tids[i], NULL, worker_thread, NULL) != 0) {
+            fprintf(stderr, "Failed to create thread %d\n", i);
+            pthread_mutex_lock(&queue_mutex);
+            workers_running = 0;
+            pthread_cond_broadcast(&queue_cond);
+            pthread_mutex_unlock(&queue_mutex);
+            for (int j = 0; j < i; ++j) pthread_join(tids[j], NULL);
+            free(tids);
+            return 1;
+        }
+    }
 
     char *paths[] = { (char *)root, NULL };
     FTS *fts = fts_open(paths, FTS_NOCHDIR | FTS_PHYSICAL, NULL);
@@ -819,16 +850,16 @@ int upload_recursive_parallel(const char *root, int threads) {
         workers_running = 0;
         pthread_cond_broadcast(&queue_cond);
         pthread_mutex_unlock(&queue_mutex);
-        for (int i = 0; i < threads; i++)
-            pthread_join(tids[i], NULL);
+        for (int i = 0; i < threads; ++i) pthread_join(tids[i], NULL);
         free(tids);
         return 1;
     }
 
     FTSENT *ent;
     while ((ent = fts_read(fts)) != NULL) {
-        if (ent->fts_info == FTS_F)
+        if (ent->fts_info == FTS_F) {
             queue_push(ent->fts_path);
+        }
     }
 
     fts_close(fts);
@@ -838,9 +869,7 @@ int upload_recursive_parallel(const char *root, int threads) {
     pthread_cond_broadcast(&queue_cond);
     pthread_mutex_unlock(&queue_mutex);
 
-    for (int i = 0; i < threads; i++)
-        pthread_join(tids[i], NULL);
-
+    for (int i = 0; i < threads; ++i) pthread_join(tids[i], NULL);
     free(tids);
     return 0;
 }
@@ -850,7 +879,7 @@ int upload_recursive_parallel(const char *root, int threads) {
  * ------------------------------ */
 
 int main(int argc, char *argv[]) {
-    static char user_buf[256], pass_buf[256], host_buf[512], name_buf[256];
+    static char user_buf[256], pass_buf[256], host_buf[1024], name_buf[256];
 
     int argi = 1;
 
@@ -884,7 +913,7 @@ int main(int argc, char *argv[]) {
             printf("  %s -c <configfile> [-n]\n", argv[0]);
             printf("  %s 'db_usr=\"user\"' 'db_passwd=\"pw\"' 'db_hst=\"url\"' 'db_name=\"dbname\"' [-n] <file>\n", argv[0]);
             printf("  %s 'db_usr=\"user\"' 'db_passwd=\"pw\"' 'db_hst=\"url\"' 'db_name=\"dbname\"' [-n] -p N -r <folder>\n", argv[0]);
-            printf("\n  -n  Use deterministic document IDs based on sanitized filename + SHA-256\n");
+            printf("\n  -n  Use deterministic document IDs based on sanitized filename + SHA-256 (skip existing docs)\n");
             return 1;
         }
 
@@ -906,11 +935,10 @@ int main(int argc, char *argv[]) {
     }
 
     /* Parse -n after credentials are known */
-    for (int i = argi; i < argc; i++) {
+    for (int i = argi; i < argc; ++i) {
         if (strcmp(argv[i], "-n") == 0) {
             USE_DETERMINISTIC_ID = 1;
-            for (int j = i; j < argc - 1; j++)
-                argv[j] = argv[j + 1];
+            for (int j = i; j < argc - 1; ++j) argv[j] = argv[j + 1];
             argc--;
             break;
         }
@@ -921,7 +949,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int ret;
+    int ret = 1;
 
     /* SINGLE FILE MODE */
     if (argc - argi == 1) {

@@ -2,7 +2,7 @@
 # FreeBSD-friendly build using clang + libcurl + pthreads
 
 CC      = cc
-CFLAGS  = -Wall -Wextra -O2
+CFLAGS  = -std=c11 -Wall -Wextra -O2
 LDFLAGS = -pthread -L/usr/local/lib
 LIBS    = -lcurl
 INCLUDES = -I/usr/local/include
