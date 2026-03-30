@@ -111,6 +111,11 @@ upcouch 'db_usr="USER"' 'db_passwd="PASS"' 'db_hst="HOSTURL"' 'db_name="DBNAME"'
 
 ### Using a config file
 
+-n
+    Use deterministic document IDs based on the filename.
+    This causes uploads to use PUT instead of POST.
+    Re-uploading the same filename overwrites the same document.
+
 upcouch can load all database parameters from a config file:
 
 ```sh
